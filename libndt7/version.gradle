@@ -1,0 +1,471 @@
+import groovy.transform.Field
+
+def final VERSION_MAJOR_BASELINE = 1
+def final VERSION_MINOR_BASELINE = 0
+def final VERSION_PATCH_BASELINE = 0
+
+def final RELEASE_BRANCH_REGEX = /^v-[0-9]+\.[0-9]+/
+def final RELEASE_TAG_REGEX = /^r-[0-9]+\.[0-9]+\.[0-9]+/
+def final RELEASE_BRANCH_PREFIX = 'v-'
+def final RELEASE_TAG_PREFIX = 'r-'
+def final LOCAL_OR_REMOTE_BRANCH_REGEX = '^refs\\/(heads|remotes\\/%s)\\/'
+def final LOCAL_BRANCH_REGEX = '^refs/heads/'
+def final REMOTE_BRANCH_REGEX = '^refs\\/remotes\\/%s\\/'
+
+@Field
+def final ENG_PREREL_PREFIX = 'eng'
+
+@Field
+def final RC_PREREL_PREFIX = 'rc'
+
+ext {
+    getCommitCount = { String startCommitOrSymbol, String endCommitOrSymbol ->
+        def cmdOutput = new ByteArrayOutputStream()
+
+        exec {
+            commandLine "git", "rev-list", "--count", startCommitOrSymbol + ".." + endCommitOrSymbol
+            standardOutput = cmdOutput
+        }
+
+        return cmdOutput.toString().trim().toInteger()
+    }
+
+    isGitTreeDirty = {
+        def cmdOutput = new ByteArrayOutputStream()
+
+        exec {
+            commandLine "git", "status", "--porcelain"
+            standardOutput = cmdOutput
+        }
+
+        return !cmdOutput.toString().trim().isEmpty()
+    }
+}
+
+def getCurrentBranch = { String commitId, String remoteName ->
+    def cmdOutput = new ByteArrayOutputStream()
+
+    exec {
+        //  Find all references (named points: branches & tags) which contain
+        //  the provided commit.
+        commandLine "git", "for-each-ref", "--format='%(refname)'", "--contains", commitId
+        standardOutput = cmdOutput
+    }
+
+    //  Take the output, filter out just local and remote branches.
+    //  Locals with start with refs/heads and remotes will start
+    //  with refs/remotes/{remoteName}.
+    def branches = cmdOutput.toString().trim()
+    def branchList = new ArrayList<String>()
+
+    branches =~ String.format(LOCAL_OR_REMOTE_BRANCH_REGEX, remoteName)
+    branches.eachLine {
+        //  The output contains single quotes, need to remove them
+        branchList.add(it.replace("\'", ""))
+    }
+
+    //  Get the number of commits between the requested commit and each
+    //  branch.  Track in a hash map of count to list of branches with
+    //  which have that count.
+    def countToBranches = new HashMap<Integer, ArrayList<String>>()
+    for (curBranch in branchList) {
+        def commitCount = getCommitCount(commitId, curBranch)
+        def commitBranchList = countToBranches[commitCount]
+        if (commitBranchList == null) {
+            commitBranchList = new ArrayList<String>()
+            countToBranches[commitCount] = commitBranchList
+        }
+
+        commitBranchList.add(curBranch)
+    }
+
+    //  Find the lowest count, that will be the closest branch to the
+    //  current commit.
+    def minCount = null
+    for (curCount in countToBranches.keySet()) {
+        if (minCount == null) {
+            minCount = curCount
+            continue
+        }
+
+        if (curCount < minCount) {
+            minCount = curCount
+        }
+    }
+
+    //  Get the branch list which has the lowest count, then split
+    //  it into release and non-release branches.  The selection
+    //  criteria are:
+    //
+    //  1. Release branch
+    //      a. If multiple release branches exist, the one with the
+    //         newest version (semantic versioning)
+    //  2. Non-release branches
+    //  3. Prefer local branches
+    //  4. If there are still multiple branches (non-release), pick
+    //     based on alphabetical sort, ascending
+    branchList = countToBranches.get(minCount)
+    def relBranches = new ArrayList<String>()
+    def nonrelBranches = new ArrayList<String>()
+
+    for (curBranch in branchList) {
+        def strippedBranch
+
+        //  Strip off the local / remote prefix for the branch, making it easier
+        //  to detect release vs. non-release branch.
+        if (curBranch =~ LOCAL_BRANCH_REGEX) {
+            strippedBranch = curBranch.replaceFirst(LOCAL_BRANCH_REGEX, '')
+        } else {
+            def remoteRegex = String.format(REMOTE_BRANCH_REGEX, remoteName)
+            strippedBranch = curBranch.replaceFirst(remoteRegex, '')
+        }
+
+        if (strippedBranch =~ RELEASE_BRANCH_REGEX) {
+            relBranches.add(curBranch)
+        } else {
+            nonrelBranches.add(curBranch)
+        }
+    }
+
+    def result
+    if (!relBranches.isEmpty()) {
+        relBranches = relBranches.sort()
+        result = relBranches.first()
+    } else if (!nonrelBranches.isEmpty()) {
+        nonrelBranches = nonrelBranches.sort()
+        result = nonrelBranches.first()
+    } else {
+        result = commitId
+    }
+
+    return result
+}
+
+
+def getShortCommitId = { String commitOrSymbol ->
+    def cmdOutput = new ByteArrayOutputStream()
+
+    exec {
+        commandLine "git", "rev-parse", "--short", commitOrSymbol
+        standardOutput = cmdOutput
+    }
+
+    return cmdOutput.toString().trim()
+}
+
+
+def getClosestReleaseTag = {
+    def cmdOutput = new ByteArrayOutputStream()
+
+    exec {
+        commandLine "git", "describe", "--tags", "--match", "r-*", "--abbrev=0"
+        standardOutput = cmdOutput
+        ignoreExitValue = true
+    }
+
+    return cmdOutput.toString().trim()
+}
+
+
+def getMainBaseCommit = { String commitOrSymbol, String remoteName ->
+    def cmdOutput = new ByteArrayOutputStream()
+
+    def mainName
+
+    if (remoteName != null) {
+        mainName = "remotes/${remoteName}/main"
+    } else {
+        mainName = "main"
+    }
+
+    exec {
+        commandLine "git", "merge-base", mainName, commitOrSymbol
+        standardOutput = cmdOutput
+    }
+
+    return cmdOutput.toString().trim()
+}
+
+
+def getRemote = {
+    //  Ask the repo for its list of remotes.
+    def remoteName = null
+    def cmdOutput = new ByteArrayOutputStream()
+
+    exec {
+        commandLine "git", "remote"
+        standardOutput = cmdOutput
+    }
+
+    def remotes = cmdOutput.toString().trim()
+    def remoteList = new ArrayList<String>()
+    remotes.eachLine {
+        remoteList.add(it.replace("\'", ""))
+    }
+
+    //  Look at the list of remotes, pick one using this order:
+    //  1. 'mirror'
+    //  2. 'origin'
+    //  3. Alphabetical
+    def remoteFound = false
+    for (curRemote in remoteList) {
+        if (curRemote == 'mirror') {
+            remoteName = curRemote
+            remoteFound = true
+            break
+        }
+
+        if (curRemote == 'origin') {
+            remoteName = curRemote
+            remoteFound = true
+            break
+        }
+    }
+
+    if (!remoteFound) {
+        remoteList = remoteList.sort()
+        remoteName = remoteList.first()
+    }
+
+    return remoteName
+}
+
+
+
+class VersionInfo {
+    int major
+    int minor
+    int patch
+
+    String baseCommit
+    int changeCount
+    String preRelPrefix
+    String shortCommitId
+
+    //  Have to use a binding in order to access getCommitCount() and
+    //  isGitTreeDirty from within the class since they are defined
+    //  in a generated class for the script.
+    Object scriptBinding
+
+    VersionInfo(int major,
+                int minor,
+                int patch,
+                boolean patchInitial,
+                String baseCommit,
+                String preRelPrefix,
+                String shortCommitId,
+                Object scriptBinding) {
+
+        this.scriptBinding = scriptBinding
+        this.major = major
+        this.minor = minor
+        this.patch = patch
+
+        this.baseCommit = baseCommit
+        this.preRelPrefix = preRelPrefix
+        this.shortCommitId = shortCommitId
+
+        this.changeCount = this.scriptBinding.getCommitCount(this.baseCommit,
+                                                             this.shortCommitId)
+        if (this.changeCount != 0 && !patchInitial) {
+            this.patch = patch + 1
+        }
+
+        println("Version major:   ${this.major}")
+        println("Version minor:   ${this.minor}")
+        println("Version patch:   ${this.patch}")
+        println("Patch init:      ${patchInitial}")
+        println("Change count:    ${this.changeCount}")
+        println("Base commit is:  ${this.baseCommit}")
+        println("Short commit id: ${this.shortCommitId}")
+        println("Pre-rel prefix:  ${this.preRelPrefix}")
+    }
+
+
+    int getVersionCode() {
+        //  This makes the version code as an integer: Mmmmpppp
+        //  Where:
+        //      M = Major version digits (no max)
+        //      m = Minor version digits (max of 3)
+        //      p = Patch version digits (max of 4)
+        return patch + (minor * 10000) + (major * 10000 * 1000)
+    }
+
+
+    String getVersionString() {
+        String version = "$major.$minor.$patch"
+
+        //  If this is a pre-release, the commit count will be non-zero
+        if (changeCount > 0) {
+            if (preRelPrefix == null || preRelPrefix.isEmpty()) {
+                preRelPrefix = "rc"
+            }
+
+            version = version + "-$preRelPrefix.$changeCount+$shortCommitId"
+
+            if (this.scriptBinding.isGitTreeDirty()) {
+                version = version + ".D"
+            }
+        } else {
+            def commitIdAdded = false
+
+            if (preRelPrefix != null && preRelPrefix == this.scriptBinding.ENG_PREREL_PREFIX) {
+                version = version + "-$preRelPrefix.$changeCount+${shortCommitId}"
+                commitIdAdded = true
+            }
+
+            if (this.scriptBinding.isGitTreeDirty()) {
+                def dirtyMarker = ".D"
+
+                if (!commitIdAdded) {
+                    dirtyMarker = "+${shortCommitId}" + dirtyMarker
+                }
+
+                version = version + dirtyMarker
+            }
+        }
+
+        return version
+    }
+}
+
+
+def getVersionInfo = {
+    //  Get the current branch
+    String remoteName = getRemote()
+    String currentBranch = getCurrentBranch('HEAD', remoteName)
+    String preRelPrefix = null
+
+    //  Base commit is the initial commit on the branch vs. main
+    String baseCommit = getMainBaseCommit(currentBranch, remoteName)
+
+    int major = VERSION_MAJOR_BASELINE
+    int minor = VERSION_MINOR_BASELINE
+    int patch = VERSION_PATCH_BASELINE
+    boolean patchInit = false
+
+    println("Current branch: $currentBranch")
+
+    //  Strip off the local / remote prefix for the branch, making it easier
+    //  to detect release vs. non-release branch.
+    def strippedBranch
+    if (currentBranch =~ LOCAL_BRANCH_REGEX) {
+        strippedBranch = currentBranch.replaceFirst(LOCAL_BRANCH_REGEX, '')
+    } else {
+        def remoteRegex = String.format(REMOTE_BRANCH_REGEX, remoteName)
+        strippedBranch = currentBranch.replaceFirst(remoteRegex, '')
+    }
+
+    //  Determine if this is a release branch
+    if (strippedBranch =~ RELEASE_BRANCH_REGEX) {
+        //  This is a release branch. Find the closest release tag which matches
+        //  the same major/minor number
+        String[] branchVersion = strippedBranch.split(RELEASE_BRANCH_PREFIX)
+        String[] branchVersionDetail = branchVersion[1].split("\\.")
+        int branchMajor = Integer.parseInt(branchVersionDetail[0])
+        int branchMinor = Integer.parseInt(branchVersionDetail[1])
+        int branchPatch = 0
+
+        //  Default to the branch version info. It will be overridden by
+        //  tag information, if available.
+        major = branchMajor
+        minor = branchMinor
+        patch = branchPatch
+
+        String relTag = getClosestReleaseTag()
+        if (relTag != null && !relTag.isEmpty()) {
+            //println("Release branch $currentBranch, closest tag: $relTag")
+
+            //  Determine if this release tag is the same major/minor
+            //  version as the branch.  If not, this is a new release
+            //  so the branch info is used.
+            if (relTag =~ RELEASE_TAG_REGEX) {
+                String[] tagVersion = relTag.split(RELEASE_TAG_PREFIX)
+                String[] tagVersionDetail = tagVersion[1].split("\\.")
+                int tagMajor = Integer.parseInt(tagVersionDetail[0])
+                int tagMinor = Integer.parseInt(tagVersionDetail[1])
+                int tagPatch = Integer.parseInt(tagVersionDetail[2])
+
+                //  The tag version info is only used if the major/minor
+                //  version matches.  In that case, only the patch from
+                //  the tag is used.
+                if (tagMajor == branchMajor && tagMinor == branchMinor) {
+                    patch = tagPatch
+
+                    //  Base commit is the tag itself
+                    baseCommit = relTag
+                }
+            } else {
+                //  Not a proper release tag.  Use the branch info and
+                //  default the patch to 0 and the pre-rel info to RC.
+                preRelPrefix = RC_PREREL_PREFIX
+                patchInit = true
+            }
+        } else {
+            //  There is no tag. Pre-rel prefix is set to RC and patch is 0.
+            preRelPrefix = RC_PREREL_PREFIX
+            patchInit = true
+        }
+    } else {
+        //  This is not a release branch.  Find the closest release tag to this
+        //  commit.  It will be used as a version starting point.
+        String closestReleaseTag = getClosestReleaseTag()
+        //println("Non-release branch $currentBranch, closest tag: $closestReleaseTag")
+
+        if (closestReleaseTag != null && !closestReleaseTag.isEmpty()) {
+            //  Determine the tag release info. This will be our baseline for
+            //  the version information.  If there is no tag, use the default
+            //  0.1.0 for major.minor.patch, set at the start.
+            if (closestReleaseTag =~ RELEASE_TAG_REGEX) {
+                String[] tagVersion = closestReleaseTag.split(RELEASE_TAG_PREFIX)
+                String[] tagVersionDetail = tagVersion[1].split("\\.")
+                major = tagVersionDetail[0].toInteger()
+                minor = tagVersionDetail[1].toInteger()
+                patch = tagVersionDetail[2].toInteger()
+
+                //  The base commit is the tag itself
+                baseCommit = closestReleaseTag
+            } else {
+                //  No release tag, just use a default major/minor/patch.
+                preRelPrefix = ENG_PREREL_PREFIX
+                patchInit = true
+            }
+        } else {
+            //  No release tag, just use a default major/minor/patch.
+            preRelPrefix = ENG_PREREL_PREFIX
+            patchInit = true
+        }
+    }
+
+    String versOverride = System.getenv('PKG_VERS_OVERRIDE')
+    if (versOverride != null && !versOverride.isEmpty()) {
+        String[] versionDetail = versOverride.split("\\.")
+        int oMajor = versionDetail[0].toInteger()
+        int oMinor = versionDetail[1].toInteger()
+        int oPatch = versionDetail[2].toInteger()
+        println("!!! Version override detected. replacing $major.$minor.$patch with $oMajor.$oMinor.$oPatch !!!")
+
+        major = oMajor
+        minor = oMinor
+        patch = oPatch
+        patchInit = true
+    }
+
+    //  Get the current commit ID
+    String commitId = getShortCommitId("HEAD")
+
+    //  Create the VersionInfo object and return it
+    return new VersionInfo(major,
+                           minor,
+                           patch,
+                           patchInit,
+                           baseCommit,
+                           preRelPrefix,
+                           commitId,
+                           this)
+}
+
+
+ext {
+    libVersionInfo = getVersionInfo()
+}

@@ -4,15 +4,50 @@ apply plugin: "kotlin-android-extensions"
 apply plugin: "maven-publish"
 apply plugin: "org.jlleitschuh.gradle.ktlint"
 
-android {
+// For handling versioning internally
+apply from: 'version.gradle'
 
+def mavenVersion = libVersionInfo.getVersionString()
+def mavenVersionCode = libVersionInfo.getVersionCode()
+
+publishing {
+    publications {
+        release(MavenPublication) {
+            groupId 'net.measurementlab.ndt7.android'
+            artifactId 'libndt7'
+            version mavenVersion
+            artifact("$buildDir/outputs/aar/libndt7-release.aar")
+        }
+
+        debug(MavenPublication) {
+            groupId 'net.measurementlab.ndt7.android'
+            artifactId 'libndt7-debug'
+            version mavenVersion
+            artifact("$buildDir/outputs/aar/libndt7-debug.aar")
+        }
+    }
+
+    repositories {
+        maven {
+            url "s3://mirror-artifacts/"
+            credentials(AwsCredentials) {
+                accessKey AWS_ACCESS_KEY
+                secretKey AWS_SECRET_KEY
+            }
+        }
+        mavenLocal()
+    }
+}
+
+android {
     compileSdkVersion 30
 
     defaultConfig {
         minSdkVersion 21
+        //noinspection ExpiredTargetSdkVersion
         targetSdkVersion 30
-        versionCode 8
-        versionName "0.2.1"
+        versionCode mavenVersionCode
+        versionName mavenVersion
         consumerProguardFiles "proguard-rules.pro"
 
         // AGP 4.1+ doesn't add VERSION_NAME or VERSION_CODE to aars by default anymore
