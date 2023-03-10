@@ -1,3 +1,51 @@
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider
+import software.amazon.awssdk.core.exception.SdkClientException
+
+ext {
+    def awsAccessKeyId = 'AWS_ACCESS_KEY'
+    def awsSecretKeyId = 'AWS_SECRET_KEY'
+    def awsProfileNameId = 'aws.profileName'
+
+    if (project.hasProperty(awsAccessKeyId)) {
+        AWS_ACCESS_KEY = project.AWS_ACCESS_KEY
+        AWS_SECRET_KEY = project.AWS_SECRET_KEY
+        AWS_SESSION_TOKEN = null
+        println("Using AWS credentials from Gradle properties")
+    } else {
+        AWS_ACCESS_KEY = System.getenv(awsAccessKeyId)
+        AWS_SECRET_KEY = System.getenv(awsSecretKeyId)
+        AWS_SESSION_TOKEN = null
+        if (AWS_ACCESS_KEY != null && AWS_SECRET_KEY != null) {
+            println("Using environment AWS credentials")
+        } else {
+            // AWS: if that fails, try reading the MFA-based credentials from ~/.aws/credentials
+            try {
+                def awsProfileName = rootProject.getProperties().get(awsProfileNameId, 'default')
+                def credentialsProvider = ProfileCredentialsProvider.create(awsProfileName)
+                def credentials = AwsCredentialsProviderChain.of(credentialsProvider)
+                        .resolveCredentials()
+
+                AWS_ACCESS_KEY = credentials.accessKeyId()
+                AWS_SECRET_KEY = credentials.secretAccessKey()
+
+                if (credentials instanceof AwsSessionCredentials) {
+                    AWS_SESSION_TOKEN = credentials.sessionToken()
+                }
+                println("Using MFA AWS credentials")
+            } catch (SdkClientException ignored) {
+                println("Failed to get MFA AWS credentials")
+            }
+        }
+    }
+
+    // AWS: and if we didn't get any of those, ¯\_(ツ)_/¯
+    if (AWS_ACCESS_KEY == null || AWS_SECRET_KEY == null) {
+        throw new RuntimeException('AWS credentials not defined')
+    }
+}
+
 buildscript {
     ext.kotlin_version = "1.4.10"
     ext.okhttp_version = "4.9.0"
@@ -17,6 +65,9 @@ buildscript {
         classpath "com.android.tools.build:gradle:4.1.1"
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
         classpath("org.jlleitschuh.gradle:ktlint-gradle:9.4.1")
+
+        // Added for uploading to internal repo
+        classpath 'software.amazon.awssdk:aws-core:2.15.9'
     }
 }
 
