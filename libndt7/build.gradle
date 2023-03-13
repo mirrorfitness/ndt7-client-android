@@ -14,14 +14,14 @@ publishing {
     publications {
         release(MavenPublication) {
             groupId 'net.measurementlab.ndt7.android'
-            artifactId 'libndt7'
+            artifactId 'mirror-libndt7'
             version mavenVersion
             artifact("$buildDir/outputs/aar/libndt7-release.aar")
         }
 
         debug(MavenPublication) {
             groupId 'net.measurementlab.ndt7.android'
-            artifactId 'libndt7-debug'
+            artifactId 'mirror-libndt7-debug'
             version mavenVersion
             artifact("$buildDir/outputs/aar/libndt7-debug.aar")
         }
